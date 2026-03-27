@@ -1,0 +1,6 @@
+.env
+*.log
+supervisor.log
+watchdog.log
+__pycache__/
+*.pyc

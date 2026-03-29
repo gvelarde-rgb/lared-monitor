@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Monitor WordPress → WhatsApp | La Red 106.1
-Modo: ejecución única (sin loop). Se lanza vía cron.
+seen_posts.json se actualiza via GitHub API (sin git push, sin conflictos)
 """
 
 import requests
@@ -9,6 +9,7 @@ import json
 import re
 import os
 import logging
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
 from html.parser import HTMLParser
@@ -20,15 +21,16 @@ load_dotenv(BASE_DIR / ".env")
 GREEN_API_INSTANCE = os.getenv("GREEN_API_INSTANCE_ID")
 GREEN_API_TOKEN    = os.getenv("GREEN_API_TOKEN")
 GROUP_ID           = os.getenv("WHATSAPP_GROUP_ID")
+GH_TOKEN           = os.getenv("GH_TOKEN")
+GH_REPO            = os.getenv("GH_REPO", "gvelarde-rgb/lared-monitor")
 WP_API_URL         = "https://cms.lared1061.com/wp-json/wp/v2/posts"
 SEEN_FILE          = BASE_DIR / "seen_posts.json"
-LOG_FILE           = BASE_DIR / "monitor.log"
 
 # ── Logging ───────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, mode='a')]
+    handlers=[logging.StreamHandler()]  # stdout → visible en GitHub Actions
 )
 log = logging.getLogger(__name__)
 
@@ -43,14 +45,64 @@ def strip_html(html):
     return re.sub(r'\s+', ' ', s.get_text()).strip()
 
 def load_seen():
+    """Carga seen_posts desde GitHub API (siempre fresco, sin conflictos)"""
+    if GH_TOKEN:
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{GH_REPO}/contents/seen_posts.json",
+                headers={"Authorization": f"token {GH_TOKEN}"},
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = json.loads(base64.b64decode(r.json()["content"]))
+                log.info(f"  seen_posts cargado desde GitHub: {len(data)} IDs")
+                return set(data), r.json()["sha"]
+        except Exception as e:
+            log.warning(f"  No se pudo cargar desde GitHub: {e}")
+    # Fallback local
     if SEEN_FILE.exists():
         with open(SEEN_FILE) as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+            return set(data), None
+    return set(), None
 
-def save_seen(seen):
+def save_seen(seen, sha=None):
+    """Guarda seen_posts via GitHub API con retry en caso de conflicto"""
+    # Guardar local siempre
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
+
+    if not GH_TOKEN:
+        return
+
+    content = base64.b64encode(json.dumps(list(seen)).encode()).decode()
+
+    # Si no tenemos sha, obtenerlo
+    if not sha:
+        r = requests.get(
+            f"https://api.github.com/repos/{GH_REPO}/contents/seen_posts.json",
+            headers={"Authorization": f"token {GH_TOKEN}"},
+            timeout=10
+        )
+        if r.status_code == 200:
+            sha = r.json()["sha"]
+
+    payload = {
+        "message": "chore: update seen posts [skip ci]",
+        "content": content,
+        "sha": sha
+    }
+
+    r = requests.put(
+        f"https://api.github.com/repos/{GH_REPO}/contents/seen_posts.json",
+        headers={"Authorization": f"token {GH_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=15
+    )
+    if r.status_code in [200, 201]:
+        log.info(f"  seen_posts guardado en GitHub")
+    else:
+        log.warning(f"  Error guardando en GitHub: {r.status_code} {r.text[:100]}")
 
 def send_whatsapp(message: str) -> bool:
     url = f"https://api.green-api.com/waInstance{GREEN_API_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
@@ -76,14 +128,14 @@ def get_category(post: dict) -> str:
         for term in group:
             if term.get("taxonomy") == "category":
                 name = term.get("name", "")
-                if name.lower() != "sin categoría" and name.lower() != "sin categoria":
+                if name.lower() not in ["sin categoría", "sin categoria", "uncategorized"]:
                     return name.upper()
     return ""
 
 def get_link(post: dict) -> str:
     return f"https://www.lared1061.com/posts/{post.get('slug', '')}"
 
-def format_message(title: str, category: str, resumen: str, link: str) -> str:
+def format_message(title, category, resumen, link):
     lines = []
     if category:
         lines.append(f"📰 *{category}*")
@@ -96,7 +148,7 @@ def format_message(title: str, category: str, resumen: str, link: str) -> str:
 # ── Main ──────────────────────────────────────────────────
 def main():
     log.info("--- Revisando WordPress ---")
-    seen = load_seen()
+    seen, sha = load_seen()
     new_count = 0
 
     try:
@@ -130,13 +182,16 @@ def main():
         msg = format_message(title, category, resumen, link)
         if send_whatsapp(msg):
             seen.add(post_id)
-            save_seen(seen)
             new_count += 1
             log.info(f"  ✓ Enviado")
         else:
             log.error(f"  ✗ Fallo al enviar")
 
-    log.info(f"  {new_count} nota(s) enviadas." if new_count else "  Sin notas nuevas.")
+    if new_count > 0:
+        save_seen(seen, sha)
+        log.info(f"  {new_count} nota(s) enviadas.")
+    else:
+        log.info("  Sin notas nuevas.")
 
 if __name__ == "__main__":
     main()

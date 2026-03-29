@@ -2,21 +2,25 @@ name: Monitor La Red 106.1
 
 on:
   schedule:
-    - cron: '*/5 5-21 * * *'   # cada 5 min, 5am-9pm UTC (equiv. 11pm-3pm GT aprox)
-    - cron: '0 22-23 * * *'    # cada hora entre 10pm-11pm UTC
-    - cron: '0 0-4 * * *'      # cada hora entre 12am-4am UTC
-  workflow_dispatch:             # permite correrlo manualmente
+    - cron: '*/5 5-21 * * *'
+    - cron: '0 22-23 * * *'
+    - cron: '0 0-4 * * *'
+  workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 4
+    concurrency:
+      group: monitor-run
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,5 +42,4 @@ jobs:
           git config user.email "monitor@lared1061.com"
           git config user.name "La Red Monitor Bot"
           git add seen_posts.json
-          git diff --staged --quiet || git commit -m "chore: update seen posts [skip ci]"
-          git push
+          git diff --staged --quiet || (git pull --rebase origin main && git commit -m "chore: update seen posts [skip ci]" && git push)

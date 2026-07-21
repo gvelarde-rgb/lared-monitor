@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Monitor WordPress → WhatsApp | La Red 106.1
+Monitor RSS → WhatsApp | La Red 106.1
+Fuente: RSS público (www.lared1061.com/feed) — servido desde Vercel,
+NO pasa por el firewall Sucuri de cms.lared1061.com que bloquea
+las IPs de GitHub Actions.
 seen_posts.json se actualiza via GitHub API (sin git push, sin conflictos)
 """
 
@@ -23,7 +26,7 @@ GREEN_API_TOKEN    = os.getenv("GREEN_API_TOKEN")
 GROUP_ID           = os.getenv("WHATSAPP_GROUP_ID")
 GH_TOKEN           = os.getenv("GH_TOKEN")
 GH_REPO            = os.getenv("GH_REPO", "gvelarde-rgb/lared-monitor")
-WP_API_URL         = "https://cms.lared1061.com/wp-json/wp/v2/posts"
+RSS_URL            = os.getenv("RSS_URL", "https://www.lared1061.com/feed/")
 SEEN_FILE          = BASE_DIR / "seen_posts.json"
 
 # ── Logging ───────────────────────────────────────────────
@@ -68,7 +71,6 @@ def load_seen():
 
 def save_seen(seen, sha=None):
     """Guarda seen_posts via GitHub API con retry en caso de conflicto"""
-    # Guardar local siempre
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
@@ -77,7 +79,6 @@ def save_seen(seen, sha=None):
 
     content = base64.b64encode(json.dumps(list(seen)).encode()).decode()
 
-    # Si no tenemos sha, obtenerlo
     if not sha:
         r = requests.get(
             f"https://api.github.com/repos/{GH_REPO}/contents/seen_posts.json",
@@ -114,74 +115,83 @@ def send_whatsapp(message: str) -> bool:
         log.error(f"Error WhatsApp: {e}")
         return False
 
-def extract_resumen(content_html: str) -> str:
-    p = re.search(r'<p[^>]*>.*?[Ll]o que necesitas saber[:\s]*</strong>(.*?)</p>', content_html, re.DOTALL | re.IGNORECASE)
-    if p:
-        return re.sub(r'^[\s:]+', '', strip_html(p.group(1))).strip()
-    p2 = re.search(r'Lo que necesitas saber[:\s]+(.*?)</p>', content_html, re.DOTALL | re.IGNORECASE)
-    if p2:
-        return strip_html(p2.group(1)).strip()
-    return ""
-
-def get_category(post: dict) -> str:
-    for group in post.get("_embedded", {}).get("wp:term", []):
-        for term in group:
-            if term.get("taxonomy") == "category":
-                name = term.get("name", "")
-                if name.lower() not in ["sin categoría", "sin categoria", "uncategorized"]:
-                    return name.upper()
-    return ""
-
-def get_link(post: dict) -> str:
-    return f"https://www.lared1061.com/posts/{post.get('slug', '')}"
-
 def format_message(title, category, resumen, link):
     lines = []
     if category:
-        lines.append(f"📰 *{category}*")
+        lines.append(f"📰 *{category.upper()}*")
     lines.append(f"*{title}*")
     if resumen:
         lines.append(f"\n{resumen}")
     lines.append(f"\n{link}")
     return "\n".join(lines)
 
+# ── RSS parsing ───────────────────────────────────────────
+def fetch_rss_items():
+    """Descarga y parsea el RSS público de La Red (servido desde Vercel,
+    no bloqueado por el firewall Sucuri de cms.lared1061.com)"""
+    try:
+        r = requests.get(RSS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        xml = r.text
+    except Exception as e:
+        log.error(f"Error obteniendo RSS: {e}")
+        return []
+
+    items = re.findall(r'<item>(.*?)</item>', xml, re.DOTALL)
+    parsed = []
+    for it in items:
+        def tag(name):
+            m = re.search(rf'<{name}>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</{name}>', it, re.DOTALL)
+            return m.group(1).strip() if m else ""
+
+        title    = strip_html(tag("title"))
+        link     = tag("link").strip()
+        guid     = tag("guid").strip() or link
+        category = strip_html(tag("category"))
+        desc     = strip_html(tag("description"))
+
+        # Si la descripción es igual al título (no aporta nada), descartarla
+        if desc.lower() == title.lower():
+            desc = ""
+
+        # Truncar resumen largo
+        if len(desc) > 320:
+            desc = desc[:317] + "..."
+
+        parsed.append({
+            "guid": guid,
+            "title": title,
+            "link": link,
+            "category": category,
+            "resumen": desc,
+        })
+    return parsed
+
 # ── Main ──────────────────────────────────────────────────
 def main():
-    log.info("--- Revisando WordPress ---")
+    log.info("--- Revisando RSS ---")
     seen, sha = load_seen()
     new_count = 0
 
-    try:
-        r = requests.get(
-            WP_API_URL,
-            params={"per_page": 20, "status": "publish", "orderby": "date", "order": "desc", "_embed": "wp:term"},
-            timeout=15
-        )
-        r.raise_for_status()
-        posts = r.json()
-    except Exception as e:
-        log.error(f"Error obteniendo posts: {e}")
+    items = fetch_rss_items()
+    if not items:
+        log.warning("  No se obtuvieron items del RSS.")
         return
 
-    log.info(f"  {len(posts)} posts recibidos")
+    log.info(f"  {len(items)} items recibidos")
 
-    for post in reversed(posts):
-        post_id = str(post.get("id", ""))
-        if not post_id or post_id in seen:
+    # Procesar en orden cronológico (RSS viene del más nuevo al más viejo)
+    for item in reversed(items):
+        guid = item["guid"]
+        if not guid or guid in seen:
             continue
 
-        title    = strip_html(post.get("title", {}).get("rendered", "Sin título"))
-        content  = post.get("content", {}).get("rendered", "")
-        link     = get_link(post)
-        category = get_category(post)
-        resumen  = extract_resumen(content)
+        log.info(f"  Nueva nota: {item['title'][:60]}")
+        log.info(f"  Categoría: {item['category'] or '(sin categoría)'}")
 
-        log.info(f"  Nueva nota [{post_id}]: {title[:60]}")
-        log.info(f"  Categoría: {category or '(sin categoría)'}")
-
-        msg = format_message(title, category, resumen, link)
+        msg = format_message(item["title"], item["category"], item["resumen"], item["link"])
         if send_whatsapp(msg):
-            seen.add(post_id)
+            seen.add(guid)
             new_count += 1
             log.info(f"  ✓ Enviado")
         else:

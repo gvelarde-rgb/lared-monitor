@@ -1,36 +1,60 @@
-name: Monitor La Red 106.1
+name: Monitor La Red 106.1 (respaldo manual)
+
+# El monitor corre 24/7 en Railway (servicio lared-monitor, scheduler.py).
+# Este workflow quedo SOLO como boton de emergencia manual.
+#
+# Blindaje: hay un disparador externo que sigue haciendo workflow_dispatch cada
+# 5 min sin enviar inputs. Sin el input force=si, el job termina sin hacer nada,
+# asi no duplica mensajes ni pelea con el guard de Railway.
 
 on:
-  schedule:
-    - cron: '*/5 5-21 * * *'
-    - cron: '0 22-23 * * *'
-    - cron: '0 0-4 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Escribir "si" para ejecutar de verdad (sin esto no hace nada)'
+        required: false
+        default: 'no'
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
 
     steps:
+      - name: Verificar autorizacion manual
+        id: guard
+        run: |
+          if [ "${{ github.event.inputs.force }}" != "si" ]; then
+            echo "Disparo sin force=si. El monitor vive en Railway. No se hace nada."
+            echo "ejecutar=no" >> $GITHUB_OUTPUT
+          else
+            echo "ejecutar=si" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout repo
+        if: steps.guard.outputs.ejecutar == 'si'
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Setup Python
+        if: steps.guard.outputs.ejecutar == 'si'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Instalar dependencias
+        if: steps.guard.outputs.ejecutar == 'si'
         run: pip install requests python-dotenv
 
-      - name: Ejecutar monitor
+      - name: Ejecutar monitor (guard en el repo, modo respaldo)
+        if: steps.guard.outputs.ejecutar == 'si'
         env:
           GREEN_API_INSTANCE_ID: ${{ secrets.GREEN_API_INSTANCE_ID }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           WHATSAPP_GROUP_ID: ${{ secrets.WHATSAPP_GROUP_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_REPO: gvelarde-rgb/lared-monitor
+          SEEN_BACKEND: github
+          DATA_DIR: /tmp/lared-monitor-data
         run: python3 monitor.py

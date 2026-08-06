@@ -364,6 +364,7 @@ def revisar_rss():
     guard, sha = load_seen()
     estado = leer_estado()
     enviadas = 0
+    cambios = 0
 
     items = fetch_rss_items()
 
@@ -403,6 +404,7 @@ def revisar_rss():
             if edad is not None and edad > MAX_EDAD_HORAS:
                 log.info("  Omitida por antiguedad (%.1f h): %s", edad, item["title"][:60])
                 guard[clave] = datetime.now(timezone.utc).isoformat()
+                cambios += 1
                 continue
 
         log.info("  Nueva nota: %s", item["title"][:70])
@@ -414,11 +416,12 @@ def revisar_rss():
         if send_whatsapp(msg):
             guard[clave] = datetime.now(timezone.utc).isoformat()
             enviadas += 1
+            cambios += 1
             log.info("  OK enviado")
         else:
             log.error("  FALLO al enviar, se reintenta en la proxima revision")
 
-    if enviadas:
+    if cambios:
         save_seen(guard, sha)
         log.info("  %s nota(s) enviadas.", enviadas)
     else:

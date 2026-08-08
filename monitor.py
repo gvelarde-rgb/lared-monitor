@@ -24,6 +24,13 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo
+
+TZ_GT = ZoneInfo("America/Guatemala")
+
 # -- Config ------------------------------------------------
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
@@ -343,18 +350,53 @@ def fetch_rss_items():
     return parsed
 
 
-def _edad_horas(pub):
+def _pub_dt(pub):
+    """
+    Convierte el pubDate del feed a datetime UTC real.
+
+    OJO: el feed de Next.js emite la hora LOCAL de Guatemala pero la etiqueta
+    como GMT. Ejemplo real: una nota publicada 17:48 GT sale como
+    "Fri, 07 Aug 2026 17:48:20 GMT". Si se toma literal, toda nota nace con
+    ~6 h de edad falsa y el filtro de antiguedad la descarta.
+
+    Regla: si el offset viene en cero (GMT / +0000), el reloj se reinterpreta
+    como hora de Guatemala. Si algun dia el feed emite un offset real distinto
+    de cero, se respeta tal cual.
+    """
     if not pub:
         return None
     try:
         from email.utils import parsedate_to_datetime
 
         dt = parsedate_to_datetime(pub)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
         return None
+
+    if dt.tzinfo is None or dt.utcoffset() == timedelta(0):
+        # Reloj local de Guatemala mal etiquetado como GMT
+        dt = dt.replace(tzinfo=TZ_GT)
+
+    return dt.astimezone(timezone.utc)
+
+
+def _edad_horas(pub):
+    dt = _pub_dt(pub)
+    if dt is None:
+        return None
+
+    edad = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+    if edad < 0:
+        # Nota "del futuro": desfase de zona horaria en el feed.
+        # Se trata como recien publicada para no descartarla nunca por fecha.
+        log.warning(
+            "  pubDate en el futuro (%.1f h): '%s'. Se asume recien publicada.",
+            edad,
+            pub,
+        )
+        return 0.0
+
+    return edad
 
 
 # -- Revision principal ------------------------------------
@@ -365,6 +407,7 @@ def revisar_rss():
     estado = leer_estado()
     enviadas = 0
     cambios = 0
+    omitidas_viejas = 0
 
     items = fetch_rss_items()
 
@@ -399,15 +442,34 @@ def revisar_rss():
         if not clave or clave in guard:
             continue
 
-        if MAX_EDAD_HORAS:
-            edad = _edad_horas(item["pubDate"])
-            if edad is not None and edad > MAX_EDAD_HORAS:
-                log.info("  Omitida por antiguedad (%.1f h): %s", edad, item["title"][:60])
+        edad = _edad_horas(item["pubDate"])
+
+        if MAX_EDAD_HORAS and edad is not None and edad > MAX_EDAD_HORAS:
+            # Solo se marca como vista si es CLARAMENTE vieja. En la zona gris
+            # se deja sin marcar para que un error de fecha no queme la nota
+            # para siempre: el siguiente ciclo la vuelve a considerar.
+            if edad > MAX_EDAD_HORAS * 1.5:
+                log.info(
+                    "  Omitida por antiguedad (%.1f h, marcada vista): %s",
+                    edad,
+                    item["title"][:60],
+                )
                 guard[clave] = datetime.now(timezone.utc).isoformat()
                 cambios += 1
-                continue
+            else:
+                log.warning(
+                    "  Omitida por antiguedad (%.1f h, zona gris, NO marcada): %s",
+                    edad,
+                    item["title"][:60],
+                )
+            omitidas_viejas += 1
+            continue
 
-        log.info("  Nueva nota: %s", item["title"][:70])
+        log.info(
+            "  Nueva nota (edad %s): %s",
+            "?" if edad is None else "%.2f h" % edad,
+            item["title"][:70],
+        )
         log.info("  Categoria: %s", item["category"] or "(sin categoria)")
 
         msg = format_message(
@@ -427,9 +489,28 @@ def revisar_rss():
     else:
         log.info("  Sin notas nuevas.")
 
+    # Rastro para el vigilante de flujo: no basta con que el monitor corra,
+    # tiene que estar SALIENDO algo.
+    ahora_iso = datetime.now(timezone.utc).isoformat()
+    if enviadas:
+        estado["ultimo_envio_ok"] = ahora_iso
+        estado["omitidas_viejas_seguidas"] = 0
+    elif omitidas_viejas:
+        estado["omitidas_viejas_seguidas"] = (
+            estado.get("omitidas_viejas_seguidas", 0) + omitidas_viejas
+        )
+    estado["ultima_revision"] = ahora_iso
+    estado["ultimo_items"] = len(items)
+    estado["ultimas_omitidas_viejas"] = omitidas_viejas
+
     guardar_estado(estado)
     escribir_latido()
-    return {"ok": True, "enviadas": enviadas, "items": len(items)}
+    return {
+        "ok": True,
+        "enviadas": enviadas,
+        "items": len(items),
+        "omitidas_viejas": omitidas_viejas,
+    }
 
 
 if __name__ == "__main__":

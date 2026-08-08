@@ -39,6 +39,10 @@ TZ = ZoneInfo("America/Guatemala")
 PORT = int(os.getenv("PORT", "8080"))
 LATIDO_MAX_MIN = int(os.getenv("LATIDO_MAX_MIN", "30"))
 REALERTA_HORAS = int(os.getenv("REALERTA_HORAS", "2"))
+# Vigilante de flujo: horas sin un solo envio exitoso, en horario de
+# publicacion, antes de avisar al admin.
+FLUJO_MAX_HORAS = int(os.getenv("FLUJO_MAX_HORAS", "4"))
+FLUJO_REALERTA_HORAS = int(os.getenv("FLUJO_REALERTA_HORAS", "6"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,6 +116,85 @@ def vigilante_latido():
     guardar_estado(estado)
 
 
+def vigilante_flujo():
+    """
+    Vigila que ALGO este saliendo al grupo, no solo que el monitor corra.
+
+    El modo de falla que motivo esto: 41 horas con el servicio "sano",
+    corriendo cada 5 min, descartando cada nota nueva por un pubDate mal
+    etiquetado. Todo verde y nada llegaba. El latido no lo detecta.
+    """
+    ahora = datetime.now(timezone.utc)
+    estado = leer_estado()
+
+    # Sin items en el feed no hay nada que enviar: no es falla del monitor.
+    if not estado.get("ultimo_items"):
+        return
+
+    ultimo_envio = estado.get("ultimo_envio_ok")
+    if ultimo_envio:
+        try:
+            horas = (ahora - datetime.fromisoformat(ultimo_envio)).total_seconds() / 3600
+        except Exception:
+            horas = None
+    else:
+        # Nunca ha enviado: se mide desde el arranque registrado
+        arranque = estado.get("arranque")
+        try:
+            horas = (ahora - datetime.fromisoformat(arranque)).total_seconds() / 3600
+        except Exception:
+            horas = None
+
+    if horas is None:
+        return
+
+    if horas <= FLUJO_MAX_HORAS:
+        if estado.get("alerta_flujo_activa"):
+            avisar_admin(
+                "MONITOR LA RED\n"
+                "Flujo restablecido: ya se estan enviando notas al grupo."
+            )
+            estado["alerta_flujo_activa"] = False
+            estado.pop("ultima_alerta_flujo", None)
+            guardar_estado(estado)
+        return
+
+    ultima = estado.get("ultima_alerta_flujo")
+    if ultima:
+        try:
+            if ahora - datetime.fromisoformat(ultima) < timedelta(
+                hours=FLUJO_REALERTA_HORAS
+            ):
+                log.warning(
+                    "Sin envios hace %.1f h pero dentro de la ventana anti-spam", horas
+                )
+                return
+        except Exception:
+            pass
+
+    # Motivo concreto, para no mandar una alerta que no dice nada
+    omitidas = estado.get("omitidas_viejas_seguidas", 0)
+    if estado.get("fallos_feed"):
+        motivo = "error de red al leer el RSS (%s fallos)" % estado["fallos_feed"]
+    elif estado.get("feed_vacio"):
+        motivo = "el RSS responde sin notas (%s veces)" % estado["feed_vacio"]
+    elif omitidas:
+        motivo = "%s nota(s) descartadas por antiguedad" % omitidas
+    else:
+        motivo = "sin notas nuevas en el feed"
+
+    ok = avisar_admin(
+        "MONITOR LA RED SIN ENVIOS\n"
+        f"Hace {horas:.1f} h que no sale una nota al grupo Al Aire LRN.\n"
+        f"El servicio SI esta corriendo (ultimo feed: {estado.get('ultimo_items')} notas).\n"
+        f"Motivo probable: {motivo}."
+    )
+    log.error("Sin envios hace %.1f h (%s). Aviso enviado: %s", horas, motivo, ok)
+    estado["alerta_flujo_activa"] = True
+    estado["ultima_alerta_flujo"] = ahora.isoformat()
+    guardar_estado(estado)
+
+
 class Salud(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.rstrip("/") not in ("", "/health"):
@@ -131,6 +214,25 @@ class Salud(BaseHTTPRequestHandler):
             }
         else:
             cuerpo = {"servicio": "lared-monitor", "estado": "arrancando"}
+
+        # Visibilidad del flujo real de envios, no solo del latido
+        estado = leer_estado()
+        envio = estado.get("ultimo_envio_ok")
+        if envio:
+            try:
+                dt = datetime.fromisoformat(envio)
+                cuerpo["ultimo_envio_gt"] = dt.astimezone(TZ).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                cuerpo["horas_desde_ultimo_envio"] = round(
+                    (ahora - dt).total_seconds() / 3600, 1
+                )
+            except Exception:
+                pass
+        else:
+            cuerpo["ultimo_envio_gt"] = None
+        cuerpo["ultimo_items_feed"] = estado.get("ultimo_items")
+        cuerpo["omitidas_por_antiguedad"] = estado.get("ultimas_omitidas_viejas")
 
         datos = dumps(cuerpo, ensure_ascii=False).encode()
         self.send_response(200)
@@ -184,6 +286,20 @@ def main():
         max_instances=1,
         coalesce=True,
     )
+    # Vigilante de flujo: cada hora en horario de publicacion 06:00-21:00 GT
+    sched.add_job(
+        vigilante_flujo,
+        CronTrigger(hour="6-21", minute=5, timezone=TZ),
+        id="vigilante_flujo",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Marca de arranque: sirve de referencia al vigilante de flujo cuando
+    # todavia no hay ningun envio registrado.
+    estado = leer_estado()
+    estado.setdefault("arranque", datetime.now(timezone.utc).isoformat())
+    guardar_estado(estado)
 
     sched.start()
 

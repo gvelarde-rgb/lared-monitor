@@ -4,8 +4,8 @@ name: Monitor La Red 106.1 (respaldo manual)
 # Este workflow quedo SOLO como boton de emergencia manual.
 #
 # Blindaje: hay un disparador externo que sigue haciendo workflow_dispatch cada
-# 5 min sin enviar inputs. Sin el input force=si, el job termina sin hacer nada,
-# asi no duplica mensajes ni pelea con el guard de Railway.
+# 5 min sin enviar inputs. Sin force=si, el job se omite antes de pedir un runner.
+# Asi no duplica mensajes ni pelea con el guard de Railway.
 
 on:
   workflow_dispatch:
@@ -17,6 +17,7 @@ on:
 
 jobs:
   monitor:
+    if: ${{ github.event.inputs.force == 'si' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
